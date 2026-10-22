@@ -1193,6 +1193,9 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         self.tile_sample_stride_height = 192
         self.tile_sample_stride_width = 192
 
+        # Extra context decoded on each side of a tile and cropped away afterwards.
+        self.tile_sample_context = 64
+
         # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
         self._cached_conv_counts = {
             "decoder": sum(isinstance(m, QwenImage21CausalConv3d) for m in self.decoder.modules())
@@ -1450,7 +1453,6 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
         return enc
 
-    # Copied from diffusers.models.autoencoders.autoencoder_kl_wan.AutoencoderKLWan.tiled_decode with unpatchify->_unpatchify
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> DecoderOutput | torch.Tensor:
         r"""
         Decode a batch of images using a tiled decoder.
@@ -1473,9 +1475,13 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
         tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
         tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
+        tile_latent_context = self.tile_sample_context // self.spatial_compression_ratio
         tile_sample_stride_height = self.tile_sample_stride_height
         tile_sample_stride_width = self.tile_sample_stride_width
+        # Decoded pixels per latent, used to crop the context off a decoded tile
+        decoded_per_latent = self.spatial_compression_ratio
         if self.config.patch_size is not None:
+            decoded_per_latent = decoded_per_latent // self.config.patch_size
             sample_height = sample_height // self.config.patch_size
             sample_width = sample_width // self.config.patch_size
             tile_sample_stride_height = tile_sample_stride_height // self.config.patch_size
@@ -1492,15 +1498,33 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         for i in range(0, height, tile_latent_stride_height):
             row = []
             for j in range(0, width, tile_latent_stride_width):
+                # Context available above and to the left of the tile; slicing clamps it below and to the right
+                context_top = min(i, tile_latent_context)
+                context_left = min(j, tile_latent_context)
                 self.clear_cache()
                 time = []
                 for k in range(num_frames):
                     self._conv_idx = [0]
-                    tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
+                    tile = z[
+                        :,
+                        :,
+                        k : k + 1,
+                        i - context_top : i + tile_latent_min_height + tile_latent_context,
+                        j - context_left : j + tile_latent_min_width + tile_latent_context,
+                    ]
                     tile = self.post_quant_conv(tile)
                     decoded = self.decoder(
                         tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
                     )
+                    crop_top = context_top * decoded_per_latent
+                    crop_left = context_left * decoded_per_latent
+                    decoded = decoded[
+                        :,
+                        :,
+                        :,
+                        crop_top : crop_top + tile_latent_min_height * decoded_per_latent,
+                        crop_left : crop_left + tile_latent_min_width * decoded_per_latent,
+                    ]
                     time.append(decoded)
                 row.append(torch.cat(time, dim=2))
             rows.append(row)

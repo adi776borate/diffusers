@@ -105,6 +105,30 @@ class TestAutoencoderKLQwenImage21(AutoencoderKLQwenImage21TesterConfig, ModelTe
 
         assert tiled.shape == untiled.shape
 
+    def test_tiled_decode_crops_tile_context(self):
+        """
+        Each tile is decoded with `tile_sample_context` extra pixels on every side, which are cropped away before
+        blending. With a context that covers the whole latent, every tile is decoded from the full latent, so the
+        cropped tiles are exact crops of the untiled decode and the tiled output must match it. The tile sizes are
+        lowered here so the tiled path actually runs on an input this small.
+        """
+        model = self.model_class(**self.get_init_dict()).to(torch_device).eval()
+        sample = self.get_dummy_inputs()["sample"]
+
+        with torch.no_grad():
+            latent = model.encode(sample).latent_dist.mode()
+            untiled = model.decode(latent).sample
+            model.enable_tiling(
+                tile_sample_min_height=48,
+                tile_sample_min_width=48,
+                tile_sample_stride_height=32,
+                tile_sample_stride_width=32,
+            )
+            model.tile_sample_context = max(self.sizes)
+            tiled = model.decode(latent).sample
+
+        assert torch.allclose(tiled, untiled, atol=1e-5)
+
 
 class TestAutoencoderKLQwenImage21SlicingTiling(AutoencoderKLQwenImage21TesterConfig, AutoencoderTesterMixin):
     """Slicing and tiling tests for AutoencoderKLQwenImage21."""
